@@ -1,0 +1,9 @@
+{
+  "bot_token": "YOUR_BOT_TOKEN_HERE",
+  "instructions": {
+    "1": "Bot is ready to use!",
+    "2": "Users can subscribe by sending /start to your bot",
+    "3": "Users can unsubscribe with /stop",
+    "4": "Users can check status with /status"
+  }
+}
