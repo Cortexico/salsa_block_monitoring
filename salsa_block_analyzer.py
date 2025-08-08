@@ -20,6 +20,28 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+
+# Strip emojis from console output (keep emojis for Telegram messages)
+import sys as _sys, re as _re
+_EMOJI_RE = _re.compile(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\u2600-\u26FF\u2700-\u27BF]")
+
+class _EmojiStrippingWriter:
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+    def write(self, s):
+        try:
+            self._wrapped.write(_EMOJI_RE.sub('', s))
+        except Exception:
+            self._wrapped.write(s)
+    def flush(self):
+        try:
+            self._wrapped.flush()
+        except Exception:
+            pass
+
+_sys.stdout = _EmojiStrippingWriter(_sys.stdout)
+_sys.stderr = _EmojiStrippingWriter(_sys.stderr)
+
 class SalsaBlockAnalyzer:
     """Comprehensive Salsa Block Analysis for Runestone transactions using Bitcoin Core RPC"""
 
@@ -399,7 +421,7 @@ class SalsaBlockAnalyzer:
         except Exception as e:
             self.logger.error(f"Exception getting transaction {txid}: {e}")
             return {}
-    
+
     def decode_runestone_data(self, script_hex: str) -> Dict:
         """Decode Runestone OP_RETURN data"""
         try:
@@ -560,7 +582,7 @@ class SalsaBlockAnalyzer:
         # The salsa analyzer returns 'candidates', not 'bets'
         candidates = results.get('candidates', [])
         if not candidates:
-            return f"🌶️ Salsa Block {block_height}: No TACOCLICKER bets found"
+            return f"Salsa Block {block_height}: No TACOCLICKER bets found"
 
         bets = candidates  # Use candidates as bets
         winner = results.get('winner')
@@ -614,140 +636,9 @@ class SalsaBlockAnalyzer:
 
         return "\n".join(message_parts)
 
-    def create_telegram_salsa_summary_option2(self, block_height: int, results: Dict) -> str:
-        """Alternative format: More explicit labeling"""
-        candidates = results.get('candidates', [])
-        if not candidates:
-            return f"🌶️ Salsa Block {block_height}: No TACOCLICKER bets found"
 
-        bets = candidates
-        winner = results.get('winner')
 
-        message_parts = [
-            f"🌶️ SALSA BLOCK {block_height} - {len(bets)} BETS",
-            ""
-        ]
 
-        if winner:
-            winner_addr = self.get_sender_address_from_txid(winner['txid'])
-            winner_short = winner_addr[:8] + "..." + winner_addr[-6:] if len(winner_addr) > 20 else winner_addr
-            message_parts.append(f"🏆 {winner_short}")
-            txid_short = winner['txid'][:7] + "..."
-            message_parts.append(f"🔗 mempool.space/tx/{txid_short}")
-            message_parts.append("")
-
-        # More explicit format with "Addr:" and "Hash:" labels
-        for i, candidate in enumerate(bets[:10]):
-            addr = self.get_sender_address_from_txid(candidate['txid'])
-            addr_short = addr[:8] + "..." + addr[-6:] if len(addr) > 20 else addr
-            hash_full = candidate.get('candidate_hash', '')
-            hash_short = hash_full[:8] + "..." + hash_full[-4:] if len(hash_full) > 16 else hash_full
-
-            if i == 0:
-                emoji = "🥇"
-            elif i == 1:
-                emoji = "🥈"
-            elif i == 2:
-                emoji = "🥉"
-            elif i <= 8:
-                emoji = f"{i+1}️⃣"
-            elif i == 9:
-                emoji = "🔟"
-            else:
-                emoji = f"{i+1:2d}"
-
-            message_parts.append(f"{emoji} Addr: {addr_short}")
-            message_parts.append(f"    Hash: {hash_short}")
-
-        return "\n".join(message_parts)
-
-    def create_telegram_salsa_summary_option3(self, block_height: int, results: Dict) -> str:
-        """Alternative format: Single line with clearer separators"""
-        candidates = results.get('candidates', [])
-        if not candidates:
-            return f"🌶️ Salsa Block {block_height}: No TACOCLICKER bets found"
-
-        bets = candidates
-        winner = results.get('winner')
-
-        message_parts = [
-            f"🌶️ SALSA BLOCK {block_height} - {len(bets)} BETS",
-            ""
-        ]
-
-        if winner:
-            winner_addr = self.get_sender_address_from_txid(winner['txid'])
-            winner_short = winner_addr[:8] + "..." + winner_addr[-6:] if len(winner_addr) > 20 else winner_addr
-            message_parts.append(f"🏆 {winner_short}")
-            txid_short = winner['txid'][:7] + "..."
-            message_parts.append(f"🔗 mempool.space/tx/{txid_short}")
-            message_parts.append("")
-
-        # Single line format with arrows
-        for i, candidate in enumerate(bets[:10]):
-            addr = self.get_sender_address_from_txid(candidate['txid'])
-            addr_short = addr[:8] + "..." + addr[-6:] if len(addr) > 20 else addr
-            hash_full = candidate.get('candidate_hash', '')
-            hash_short = hash_full[:8] + "..." + hash_full[-4:] if len(hash_full) > 16 else hash_full
-
-            if i == 0:
-                emoji = "🥇"
-            elif i == 1:
-                emoji = "🥈"
-            elif i == 2:
-                emoji = "🥉"
-            elif i <= 8:
-                emoji = f"{i+1}️⃣"
-            elif i == 9:
-                emoji = "🔟"
-            else:
-                emoji = f"{i+1:2d}"
-
-            message_parts.append(f"{emoji} {addr_short} → {hash_short}")
-
-        return "\n".join(message_parts)
-
-    def create_telegram_salsa_summary_option4(self, block_height: int, results: Dict) -> str:
-        """Alternative format: Full addresses and hashes (no truncation)"""
-        candidates = results.get('candidates', [])
-        if not candidates:
-            return f"🌶️ Salsa Block {block_height}: No TACOCLICKER bets found"
-
-        bets = candidates
-        winner = results.get('winner')
-
-        message_parts = [
-            f"🌶️ SALSA BLOCK {block_height} - {len(bets)} BETS",
-            ""
-        ]
-
-        if winner:
-            winner_addr = self.get_sender_address_from_txid(winner['txid'])
-            message_parts.append(f"🏆 {winner_addr}")
-            message_parts.append(f"🔗 mempool.space/tx/{winner['txid']}")
-            message_parts.append("")
-
-        # Full format with complete addresses and hashes
-        for i, candidate in enumerate(bets[:10]):
-            addr = self.get_sender_address_from_txid(candidate['txid'])
-            hash_full = candidate.get('candidate_hash', '')
-
-            if i == 0:
-                emoji = "🥇"
-            elif i == 1:
-                emoji = "🥈"
-            elif i == 2:
-                emoji = "🥉"
-            elif i <= 8:
-                emoji = f"{i+1}️⃣"
-            elif i == 9:
-                emoji = "🔟"
-            else:
-                emoji = f"{i+1:2d}"
-
-            message_parts.append(f"{emoji} {addr} | {hash_full}")
-
-        return "\n".join(message_parts)
 
     def get_sender_address_from_txid(self, txid: str) -> str:
         """Get sender address from transaction ID"""
@@ -763,6 +654,42 @@ class SalsaBlockAnalyzer:
         except Exception as e:
             self.logger.debug(f"Error getting sender address for {txid}: {e}")
         return "Unknown"
+
+    def send_telegram_notification(self, analysis_result: Dict):
+        """Send salsa block analysis results to Telegram"""
+        try:
+            # Try to load Telegram config and send notification
+            from simple_telegram_bot import load_telegram_config, SimpleTelegramIntegration
+
+            # Load Telegram configuration
+            config = load_telegram_config()
+
+            # Create bot integration
+            bot = SimpleTelegramIntegration(config['bot_token'])
+
+            # Generate the Telegram summary using the preferred format (arrow format with truncated addresses)
+            block_height = analysis_result['block_height']
+            telegram_summary = self.create_telegram_salsa_summary(block_height, analysis_result)
+
+            # Send the summary
+            success = bot.send_salsa_block_results(telegram_summary)
+
+            if success:
+                print(f"Telegram notification sent for block {block_height}")
+                self.logger.info(f"Telegram notification sent successfully for block {block_height}")
+            else:
+                print(f"Telegram notification failed for block {block_height}")
+                self.logger.warning(f"Telegram notification failed for block {block_height}")
+
+        except FileNotFoundError:
+            print("Telegram config not found - skipping notification")
+            self.logger.info("Telegram config not found - skipping notification")
+        except ImportError:
+            print("Telegram bot module not available - skipping notification")
+            self.logger.info("Telegram bot module not available - skipping notification")
+        except Exception as e:
+            print(f"Telegram notification error: {e}")
+            self.logger.error(f"Telegram notification error: {e}")
 
     def log_bet_transaction(self, txid: str, tx_details: Dict, position: int):
         """Log detailed information about a bet transaction"""
@@ -817,7 +744,7 @@ class SalsaBlockAnalyzer:
 
         except Exception as e:
             self.logger.error(f"Error logging bet transaction {txid}: {e}")
-    
+
     def calculate_candidate_hash(self, txid: str, block_hash: str) -> Tuple[str, int]:
         """Calculate SHA256(txid XOR blockhash) for salsa competition"""
         try:
@@ -845,8 +772,8 @@ class SalsaBlockAnalyzer:
             print(f"TXID: {txid} (len: {len(txid)})")
             print(f"Block hash: {block_hash} (len: {len(block_hash)})")
             raise
-    
-    def analyze_salsa_block(self, block_height: int) -> Dict:
+
+    def analyze_salsa_block(self, block_height: int, send_telegram: bool = True) -> Dict:
         """Comprehensive analysis of a salsa block"""
         analysis_start = datetime.now()
 
@@ -961,7 +888,7 @@ class SalsaBlockAnalyzer:
         for tx in bet_txs:
             txid = tx['txid']
             candidate_hash, candidate_int = self.calculate_candidate_hash(txid, block_hash)
-            
+
             candidates.append({
                 'txid': txid,
                 'position': tx['position'],
@@ -970,7 +897,7 @@ class SalsaBlockAnalyzer:
                 'fee': tx['fee'],
                 'size': tx['size']
             })
-        
+
         # Sort by candidate hash value (lowest wins)
         candidates.sort(key=lambda x: x['candidate_int'])
 
@@ -1048,7 +975,7 @@ class SalsaBlockAnalyzer:
             self.bet_logger.info(f"Address: {sender_address}")
             self.bet_logger.info(f"Hash: {winner['candidate_hash']}")
             self.bet_logger.info(f"Fee: {winner['fee']} sats")
-        
+
         # Display top 10 candidates
         print("=== TOP 10 CANDIDATES ===")
 
@@ -1070,7 +997,7 @@ class SalsaBlockAnalyzer:
 
             print(f"{i:2d}. {txid_short} ({sender_address})")
             print(f"    Hash: {hash_short}")
-        
+
         analysis_result = {
             'block_height': block_height,
             'block_hash': block_hash,
@@ -1116,6 +1043,14 @@ class SalsaBlockAnalyzer:
             error_msg = f"Warning: Could not save results to file: {e}"
             print(error_msg)
             self.logger.error(error_msg)
+
+        # Send Telegram notification if enabled
+        if send_telegram:
+            try:
+                self.send_telegram_notification(analysis_result)
+            except Exception as e:
+                print(f"Warning: Could not send Telegram notification: {e}")
+                self.logger.error(f"Telegram notification failed: {e}")
 
         # Close logging handlers
         self.logger.info("=== LOGGING SESSION COMPLETE ===")

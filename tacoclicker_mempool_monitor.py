@@ -19,18 +19,40 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# Strip emojis from console output (keep emojis for Telegram messages)
+import sys as _sys, re as _re
+_EMOJI_RE = _re.compile(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\u2600-\u26FF\u2700-\u27BF]")
+
+class _EmojiStrippingWriter:
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+    def write(self, s):
+        try:
+            self._wrapped.write(_EMOJI_RE.sub('', s))
+        except Exception:
+            self._wrapped.write(s)
+    def flush(self):
+        try:
+            self._wrapped.flush()
+        except Exception:
+            pass
+
+_sys.stdout = _EmojiStrippingWriter(_sys.stdout)
+_sys.stderr = _EmojiStrippingWriter(_sys.stderr)
+
+
 # Import Telegram bot integration
 try:
     from simple_telegram_bot import SimpleTelegramIntegration, load_telegram_config
     TELEGRAM_AVAILABLE = True
 except ImportError:
     TELEGRAM_AVAILABLE = False
-    print("⚠️  Telegram integration not available")
+    print("Telegram integration not available")
 
 class TacoClickerMempoolMonitor:
     """Real-time monitor for TACOCLICKER bet transactions in mempool and blocks"""
 
-    def __init__(self, rpc_credentials_file: str = "bitcoin_rpc_credentials.json", max_threads: int = 4, enable_telegram: bool = False):
+    def __init__(self, rpc_credentials_file: str = "bitcoin_rpc_credentials.json", max_threads: int = 4, enable_telegram: bool = False, simulation_mode: bool = False):
         # Load Bitcoin Core RPC credentials
         self.rpc_credentials = self.load_rpc_credentials(rpc_credentials_file)
 
@@ -38,8 +60,14 @@ class TacoClickerMempoolMonitor:
         self.telegram_bot = None
         self.enable_telegram = enable_telegram
         if enable_telegram and not TELEGRAM_AVAILABLE:
-            print("⚠️  Telegram requested but not available (install python-telegram-bot)")
+            print("Telegram requested but not available (install python-telegram-bot)")
             self.enable_telegram = False
+
+        # Simulation mode: inject fake bet flows for realistic testing
+        self.simulation_mode = simulation_mode
+        self.simulated_bets: Set[str] = set()
+        self.simulation_start_time = time.time()
+        self.last_simulation_event = time.time()
 
         # RPC connection settings
         self.rpc_url = f"http://{self.rpc_credentials['rpchost']}:{self.rpc_credentials['rpcport']}"
@@ -55,6 +83,15 @@ class TacoClickerMempoolMonitor:
         self.last_bet_count: int = 0  # Previous bet count for change detection
         self.last_block_height: Optional[int] = None
         self.last_mempool_check: float = 0
+        self.last_block_time: float = 0.0  # Used to reset mempool baseline after blocks
+
+        # Batching for mempool notifications (reduce chat noise)
+        self.batch_window_seconds: float = 10.0
+        self._batch_accumulator = {
+            'new_bets': set(),
+            'removed_bets': set(),
+            'last_reported_count': 0,
+        }
 
         # Block comparison tracking
         self.expected_bets_for_next_block: Set[str] = set()  # Bets we expect to be mined
@@ -71,7 +108,11 @@ class TacoClickerMempoolMonitor:
         self.last_summary_time: float = time.time()
         self.hourly_new_bets: int = 0
         self.hourly_removed_bets: int = 0
-        
+
+        # Simulation cadence
+        self.sim_normal_range = (0, 2)   # bets per batch before normal blocks
+        self.sim_salsa_range = (20, 50)  # bets per batch before salsa blocks
+
         # Setup connection session
         self.session = requests.Session()
         retry_strategy = Retry(
@@ -86,10 +127,10 @@ class TacoClickerMempoolMonitor:
         )
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
-        
+
         # Setup logging
         self.setup_logging()
-        
+
         # Test connection
         self.test_rpc_connection()
 
@@ -144,7 +185,7 @@ class TacoClickerMempoolMonitor:
             os.makedirs(log_dir)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
+
         # Main logger
         self.logger = logging.getLogger('MempoolMonitor')
         self.logger.setLevel(logging.DEBUG)
@@ -237,7 +278,12 @@ class TacoClickerMempoolMonitor:
             return []
 
     def get_next_block_candidates(self) -> List[str]:
-        """Get transactions that are likely to be in the next block (high priority)"""
+        """Get transactions that are likely to be in the next block (high priority).
+        In simulation_mode we synthesize candidate txids to emulate load.
+        """
+        if self.simulation_mode:
+            return list(self.simulated_bets)
+
         try:
             # Get block template - this shows what would be in the next block
             template = self.make_rpc_call("getblocktemplate", [{"rules": ["segwit"]}])
@@ -289,11 +335,32 @@ class TacoClickerMempoolMonitor:
             return []
 
     def get_transaction_details(self, txid: str) -> Dict:
-        """Get detailed transaction information"""
+        """Get detailed transaction information.
+        In simulation_mode, synthesize a Runestone OP_RETURN-esque output for any txid.
+        """
+        if self.simulation_mode:
+            # Fake but structurally correct shape with an OP_RETURN-like output
+            return {
+                'txid': txid,
+                'size': 200,
+                'vsize': 180,
+                'weight': 720,
+                'fee': 1000,
+                'confirmations': 0,
+                'vin': [{'txid': '00'*32, 'vout': 0}],
+                'vout': [
+                    {
+                        'value': 0,
+                        'scriptpubkey': '6a' + '4c' + '2a' + 'ff7f8196ec82d08bc0a882' + 'efa68ada' + 'abcd'*6 + 'ecaebea040',
+                        'scriptpubkey_address': ''
+                    }
+                ]
+            }
+
         try:
             # Get raw transaction with verbose output
             tx_data = self.make_rpc_call("getrawtransaction", [txid, True])
-            
+
             if not tx_data:
                 return {}
 
@@ -465,7 +532,7 @@ class TacoClickerMempoolMonitor:
             op_return_data = self.get_op_return_data(tx_details)
 
             # Log to console
-            print(f"🎯 [{timestamp}] TACOCLICKER BET DETECTED ({source})")
+            print(f" [{timestamp}] TACOCLICKER BET DETECTED ({source})")
             print(f"   TXID: {txid}")
             print(f"   Sender: {sender_address}")
             print(f"   Fee: {tx_details.get('fee', 0)} sats")
@@ -499,7 +566,7 @@ class TacoClickerMempoolMonitor:
             result['total_candidates'] = len(next_block_candidates)
 
             if not next_block_candidates:
-                print("⚠️  No next-block candidates found")
+                print("No next-block candidates found")
                 return result
 
             # Find TACOCLICKER bets among candidates
@@ -518,13 +585,18 @@ class TacoClickerMempoolMonitor:
             new_bets = current_bets - self.current_mempool_bets
             removed_bets = self.current_mempool_bets - current_bets
 
-            result['new_bets'] = list(new_bets)
-            result['removed_bets'] = list(removed_bets)
+            # Batch accumulation to reduce chat noise
+            self._batch_accumulator['new_bets'].update(new_bets)
+            self._batch_accumulator['removed_bets'].update(removed_bets)
+
+            # Fill result with current instantaneous snapshot (used by UI/logic)
+            result['new_bets'] = list(self._batch_accumulator['new_bets'])
+            result['removed_bets'] = list(self._batch_accumulator['removed_bets'])
             result['current_count'] = len(current_bets)
             result['previous_count'] = self.last_bet_count
             result['net_change'] = len(current_bets) - self.last_bet_count
 
-            # Log new bets
+            # Log new bets (just once when first seen)
             for txid in new_bets:
                 try:
                     tx_details = self.get_transaction_details(txid)
@@ -535,7 +607,7 @@ class TacoClickerMempoolMonitor:
                 except Exception as e:
                     self.logger.debug(f"Error logging new bet {txid}: {e}")
 
-            # Log removed bets
+            # Log removed bets (file log only)
             for txid in removed_bets:
                 self.logger.info(f"BET REMOVED from next-block candidates (low fee): {txid}")
                 self.hourly_removed_bets += 1
@@ -593,10 +665,18 @@ class TacoClickerMempoolMonitor:
             missed_predictions = expected_set - actual_set  # Expected but not mined
             unexpected_bets = actual_set - expected_set     # Mined but not expected
 
-            # Calculate accuracy
+            # Calculate accuracy: correct predictions / max(expected, actual)
             total_expected = len(expected_set)
+            total_actual = len(actual_set)
             total_correct = len(correctly_predicted)
-            accuracy = (total_correct / total_expected * 100) if total_expected > 0 else 100
+
+            if total_expected == 0 and total_actual == 0:
+                accuracy = 100.0  # Perfect if both are zero
+            elif total_expected == 0:
+                accuracy = 0.0     # We expected nothing but got something
+            else:
+                # Standard accuracy: correct / expected
+                accuracy = (total_correct / total_expected * 100)
 
             result.update({
                 'actual_bets': actual_bets,
@@ -619,15 +699,15 @@ class TacoClickerMempoolMonitor:
                 self.mined_vs_expected_stats['accuracy_rate'] = overall_accuracy
 
             # Log results
-            print(f"📊 Block {block_height} Analysis:")
+            print(f"Block {block_height} Analysis:")
             print(f"   Expected: {total_expected} bets")
             print(f"   Actual: {len(actual_bets)} bets")
             print(f"   Correctly predicted: {total_correct} ({accuracy:.1f}%)")
 
             if missed_predictions:
-                print(f"   ❌ Missed (expected but not mined): {len(missed_predictions)}")
+                print(f"Missed (expected but not mined): {len(missed_predictions)}")
             if unexpected_bets:
-                print(f"   ➕ Unexpected (mined but not expected): {len(unexpected_bets)}")
+                print(f"Unexpected (mined but not expected): {len(unexpected_bets)}")
 
             # Reset expected bets for next block
             self.expected_bets_for_next_block.clear()
@@ -648,20 +728,22 @@ class TacoClickerMempoolMonitor:
             )
 
             # Analyze the salsa block
-            results = analyzer.analyze_salsa_block(block_height)
+            # If our monitor has Telegram enabled, we will send the Telegram message ourselves
+            # to control formatting and avoid duplicates. Otherwise, allow the analyzer to send.
+            results = analyzer.analyze_salsa_block(block_height, send_telegram=not self.enable_telegram)
 
-            if results and results.get('bets'):
-                # Create concise Telegram summary
+            if results and results.get('candidates'):
+                # Create concise Telegram summary (preferred truncated format)
                 telegram_summary = analyzer.create_telegram_salsa_summary(block_height, results)
 
-                self.logger.info(f"Salsa block {block_height} analysis completed: {len(results['bets'])} bets")
+                self.logger.info(f"Salsa block {block_height} analysis completed: {len(results['candidates'])} bets")
                 return telegram_summary
             else:
-                return f"🎯 Salsa Block {block_height}: No TACOCLICKER bets found"
+                return f"Salsa Block {block_height}: No TACOCLICKER bets found"
 
         except Exception as e:
             self.logger.error(f"Error running salsa block analysis for block {block_height}: {e}")
-            return f"❌ Salsa Block {block_height}: Analysis failed"
+            return f"Salsa Block {block_height}: Analysis failed"
 
     def is_salsa_block(self, block_height: int) -> bool:
         """Check if block is a salsa block (every 144 blocks starting from 908352)"""
@@ -696,14 +778,14 @@ class TacoClickerMempoolMonitor:
                     telegram_config['bot_token']
                 )
                 if self.telegram_bot.start_bot(next_salsa):
-                    print("✅ Telegram bot integration enabled")
+                    print("Telegram bot integration enabled")
                     return True
                 else:
-                    print("❌ Failed to start Telegram bot")
+                    print("Failed to start Telegram bot")
                     self.telegram_bot = None
                     return False
             except Exception as e:
-                print(f"⚠️  Telegram bot setup failed: {e}")
+                print(f"Telegram bot setup failed: {e}")
                 self.telegram_bot = None
                 return False
         return False
@@ -719,7 +801,7 @@ class TacoClickerMempoolMonitor:
         # Initialize with current block height
         self.last_block_height = self.get_current_block_height()
         if self.last_block_height:
-            print(f"🏁 Starting monitoring at block {self.last_block_height}")
+            print(f"Starting monitoring at block {self.last_block_height}")
 
             # Set up Telegram bot with next salsa block info
             if self.enable_telegram:
@@ -732,6 +814,31 @@ class TacoClickerMempoolMonitor:
             while True:
                 current_time = time.time()
 
+                # Simulation: inject random flows periodically
+                if self.simulation_mode and (current_time - self.last_simulation_event) >= max(3, self.batch_window_seconds/8):
+                    try:
+                        # Decide next-block context
+                        height_hint = self.last_block_height or self.get_current_block_height() or 0
+                        is_salsa_soon = ((self.get_next_salsa_block(height_hint) - height_hint) <= 1)
+                        low, high = (self.sim_salsa_range if is_salsa_soon else self.sim_normal_range)
+
+                        import random, secrets
+                        add = random.randint(low, high)
+                        # Optionally remove some existing after initial adds
+                        remove = random.randint(0, max(0, add // 3)) if self.simulated_bets else 0
+
+                        # Generate new fake txids
+                        for _ in range(add):
+                            txid = secrets.token_hex(32)
+                            self.simulated_bets.add(txid)
+                        # Remove a few to simulate falling behind
+                        for txid in list(self.simulated_bets)[:remove]:
+                            self.simulated_bets.discard(txid)
+
+                        self.last_simulation_event = current_time
+                    except Exception:
+                        pass
+
                 # Check for new blocks
                 current_height = self.get_current_block_height()
                 if current_height and current_height != self.last_block_height:
@@ -740,27 +847,44 @@ class TacoClickerMempoolMonitor:
                         for height in range(self.last_block_height + 1, current_height + 1):
                             timestamp = datetime.now().strftime("%H:%M:%S")
                             is_salsa = self.is_salsa_block(height)
-                            salsa_indicator = " 🎯 SALSA BLOCK!" if is_salsa else ""
-                            print(f"[{timestamp}] 🆕 New Block {height}{salsa_indicator}")
+                            salsa_indicator = " -SALSA BLOCK!" if is_salsa else ""
+                            print(f"[{timestamp}] New Block {height}{salsa_indicator}")
 
                             if is_salsa:
                                 # SALSA BLOCK - Run full salsa analysis
-                                print(f"🎯 SALSA BLOCK {height} - Running full analysis...")
+                                print(f"SALSA BLOCK {height} - Running full analysis...")
 
                                 # Send initial salsa block notification
                                 if self.telegram_bot:
                                     try:
                                         self.telegram_bot.send_salsa_block_alert(height)
+                                        print(f"Sent salsa block mined notification for block {height}")
                                     except Exception as e:
-                                        self.logger.debug(f"Telegram salsa block notification failed: {e}")
+                                        print(f"Telegram salsa block notification failed: {e}")
+                                        self.logger.error(f"Telegram salsa block notification failed: {e}")
 
                                 # Run comprehensive salsa block analysis
                                 try:
                                     salsa_results = self.run_salsa_block_analysis(height)
                                     if salsa_results and self.telegram_bot:
                                         self.telegram_bot.send_salsa_block_results(salsa_results)
+                                        print(f"Sent salsa block analysis results for block {height}")
+                                    elif not salsa_results:
+                                        print(f"No salsa analysis results generated for block {height}")
+                                    elif not self.telegram_bot:
+                                        print(f"No Telegram bot available for salsa results")
                                 except Exception as e:
-                                    self.logger.debug(f"Salsa block analysis failed: {e}")
+                                    print(f"Salsa block analysis failed: {e}")
+                                    self.logger.error(f"Salsa block analysis failed: {e}")
+
+                                # After a salsa block is mined, refresh mempool baseline and batch accumulators
+                                self.current_mempool_bets.clear()
+                                self.expected_bets_for_next_block.clear()
+                                self.last_bet_count = 0
+                                self._batch_accumulator['new_bets'].clear()
+                                self._batch_accumulator['removed_bets'].clear()
+                                self._batch_accumulator['last_reported_count'] = 0
+                                self.last_mempool_check = time.time()
 
                             else:
                                 # NORMAL BLOCK - Only run expected vs actual analysis
@@ -778,37 +902,64 @@ class TacoClickerMempoolMonitor:
                                     except Exception as e:
                                         self.logger.debug(f"Telegram block analysis failed: {e}")
 
+                                # After a block is mined, refresh mempool baseline and batch accumulators
+                                self.current_mempool_bets.clear()
+                                self.expected_bets_for_next_block.clear()
+                                self.last_bet_count = 0
+                                self._batch_accumulator['new_bets'].clear()
+                                self._batch_accumulator['removed_bets'].clear()
+                                self._batch_accumulator['last_reported_count'] = 0
+                                self.last_mempool_check = time.time()
+
                     self.last_block_height = current_height
 
                 # Check mempool bet changes periodically
                 if current_time - self.last_mempool_check >= mempool_interval:
                     bet_changes = self.scan_mempool_bet_changes()
 
-                    # Show changes if any occurred
+                    # Check if batch window has elapsed for Telegram notifications
+                    time_since_last_batch = current_time - self.last_mempool_check
+                    batch_window_elapsed = time_since_last_batch >= self.batch_window_seconds
+
+                    # Show changes to console immediately for observability
                     if bet_changes['net_change'] != 0 or bet_changes['new_bets'] or bet_changes['removed_bets']:
                         current_count = bet_changes['current_count']
                         previous_count = bet_changes['previous_count']
                         new_count = len(bet_changes['new_bets'])
                         removed_count = len(bet_changes['removed_bets'])
 
-                        print(f"📊 TACOCLICKER Bet Count: {current_count} (was {previous_count})")
+                        print(f"TACOCLICKER Bet Count: {current_count} (was {previous_count})")
                         if new_count > 0:
-                            print(f"   ➕ {new_count} new bets added to next-block candidates")
+                            print(f"{new_count} new bets added to next-block candidates")
                         if removed_count > 0:
-                            print(f"   ➖ {removed_count} bets removed (low fees)")
+                            print(f"{removed_count} bets removed (low fees)")
 
-                        # Send Telegram notification for significant changes
-                        if self.telegram_bot and (new_count > 0 or removed_count > 0):
+                    # Send Telegram notification if batch window elapsed and we have accumulated changes
+                    if self.telegram_bot and batch_window_elapsed:
+                        accumulated_new = len(self._batch_accumulator['new_bets'])
+                        accumulated_removed = len(self._batch_accumulator['removed_bets'])
+
+                        if accumulated_new > 0 or accumulated_removed > 0:
                             try:
                                 next_salsa = self.get_next_salsa_block(current_height) if current_height else 0
+                                # Calculate previous count for the batch
+                                batch_previous_count = bet_changes['current_count'] - accumulated_new + accumulated_removed
+
                                 self.telegram_bot.send_bet_count_update(
-                                    current_count, previous_count, new_count, removed_count,
+                                    bet_changes['current_count'], batch_previous_count,
+                                    accumulated_new, accumulated_removed,
                                     next_salsa, current_height
                                 )
+                                print(f"Sent Telegram batch update: {bet_changes['current_count']} bets (+{accumulated_new} new, -{accumulated_removed} removed)")
                             except Exception as e:
                                 self.logger.debug(f"Telegram bet count update failed: {e}")
+                                print(f"Telegram bet update failed: {e}")
 
-                    self.last_mempool_check = current_time
+                        # Reset batch window timer and clear accumulators
+                        self._batch_accumulator['new_bets'].clear()
+                        self._batch_accumulator['removed_bets'].clear()
+                        self._batch_accumulator['last_reported_count'] = bet_changes['current_count']
+                        self.last_mempool_check = current_time
 
                 # Show periodic summary (every minute)
                 if current_time - self.last_summary_time >= 60:  # 1 minute
@@ -819,11 +970,11 @@ class TacoClickerMempoolMonitor:
                 time.sleep(block_check_interval)
 
         except KeyboardInterrupt:
-            print("\n🛑 Monitoring stopped by user")
+            print("\nMonitoring stopped by user")
             self.show_final_summary()
             self.logger.info("Monitoring stopped by user")
         except Exception as e:
-            print(f"❌ Monitoring error: {e}")
+            print(f"Monitoring error: {e}")
             self.show_final_summary()
             self.logger.error(f"Monitoring error: {e}")
 
@@ -834,22 +985,22 @@ class TacoClickerMempoolMonitor:
         hours_running = session_duration / 3600
         total_bets = self.total_mempool_bets + self.total_block_bets
 
-        print(f"\n🏁 === FINAL SESSION SUMMARY ===")
-        print(f"   ⏱️  Total Duration: {hours_running:.2f} hours")
-        print(f"   🎯 Total Bets Detected: {total_bets}")
-        print(f"      📥 From Mempool: {self.total_mempool_bets}")
-        print(f"      🔗 From Blocks: {self.total_block_bets}")
+        print(f"\n=== FINAL SESSION SUMMARY ===")
+        print(f"   Total Duration: {hours_running:.2f} hours")
+        print(f"   Total Bets Detected: {total_bets}")
+        print(f"      From Mempool: {self.total_mempool_bets}")
+        print(f"      From Blocks: {self.total_block_bets}")
 
         if hours_running > 0:
             rate_per_hour = total_bets / hours_running
-            print(f"   📈 Average Rate: {rate_per_hour:.1f} bets/hour")
+            print(f"   Average Rate: {rate_per_hour:.1f} bets/hour")
 
         if session_duration > 60:
             minutes = session_duration / 60
             rate_per_minute = total_bets / minutes
-            print(f"   📊 Average Rate: {rate_per_minute:.2f} bets/minute")
+            print(f"   Average Rate: {rate_per_minute:.2f} bets/minute")
 
-        print(f"   🔄 Total RPC Calls: {self.rpc_calls_made}")
+        print(f"   Total RPC Calls: {self.rpc_calls_made}")
         print("=" * 50)
 
         # Log final summary
@@ -864,26 +1015,26 @@ class TacoClickerMempoolMonitor:
         timestamp = datetime.now().strftime("%H:%M:%S")
         current_bet_count = len(self.current_mempool_bets)
 
-        print(f"\n📊 [{timestamp}] === TACOCLICKER MONITORING SUMMARY ===")
-        print(f"   ⏱️  Session Duration: {hours_running:.1f} hours")
-        print(f"   🎯 Current Next-Block Bets: {current_bet_count}")
-        print(f"   📈 Total Unique Bets Seen: {self.total_unique_bets_seen}")
+        print(f"\n [{timestamp}] === TACOCLICKER MONITORING SUMMARY ===")
+        print(f"     Session Duration: {hours_running:.1f} hours")
+        print(f"    Current Next-Block Bets: {current_bet_count}")
+        print(f"    Total Unique Bets Seen: {self.total_unique_bets_seen}")
 
         if hours_running > 0:
             rate_per_hour = self.total_unique_bets_seen / hours_running
-            print(f"   📊 Discovery Rate: {rate_per_hour:.1f} bets/hour")
+            print(f"    Discovery Rate: {rate_per_hour:.1f} bets/hour")
 
         # Show hourly stats and reset
         if self.hourly_new_bets > 0 or self.hourly_removed_bets > 0:
-            print(f"   🕐 Last Hour: +{self.hourly_new_bets} new, -{self.hourly_removed_bets} removed")
+            print(f"    Last Hour: +{self.hourly_new_bets} new, -{self.hourly_removed_bets} removed")
 
         # Show block analysis stats
         stats = self.mined_vs_expected_stats
         if stats['total_blocks_analyzed'] > 0:
-            print(f"   🔍 Blocks Analyzed: {stats['total_blocks_analyzed']}")
-            print(f"   🎯 Prediction Accuracy: {stats['accuracy_rate']:.1f}%")
+            print(f"    Blocks Analyzed: {stats['total_blocks_analyzed']}")
+            print(f"    Prediction Accuracy: {stats['accuracy_rate']:.1f}%")
 
-        print(f"   🔄 RPC Calls Made: {self.rpc_calls_made}")
+        print(f"    RPC Calls Made: {self.rpc_calls_made}")
         print("=" * 60)
         print()
 
@@ -901,17 +1052,17 @@ class TacoClickerMempoolMonitor:
 
     def check_specific_transaction(self, txid: str):
         """Check if a specific transaction is a TACOCLICKER bet"""
-        print(f"🔍 Checking transaction: {txid}")
+        print(f" Checking transaction: {txid}")
 
         try:
             # Get transaction details
             tx_details = self.get_transaction_details(txid)
 
             if not tx_details:
-                print(f"❌ Transaction {txid} not found or not accessible")
+                print(f" Transaction {txid} not found or not accessible")
                 return False
 
-            print(f"✅ Transaction found:")
+            print(f" Transaction found:")
             print(f"   Size: {tx_details.get('size', 0)} bytes")
             print(f"   VSize: {tx_details.get('vsize', 0)} bytes")
             print(f"   Confirmations: {tx_details.get('confirmations', 0)}")
@@ -920,7 +1071,7 @@ class TacoClickerMempoolMonitor:
             is_bet = self.is_tacoclicker_bet(tx_details)
 
             if is_bet:
-                print(f"🎯 ✅ TACOCLICKER BET DETECTED!")
+                print(f" TACOCLICKER BET DETECTED!")
                 op_return_data = self.get_op_return_data(tx_details)
                 sender_address = self.get_sender_address(txid)
 
@@ -932,7 +1083,7 @@ class TacoClickerMempoolMonitor:
                 self.log_bet_transaction(txid, tx_details, source)
 
             else:
-                print(f"❌ Not a TACOCLICKER bet transaction")
+                print(f" Not a TACOCLICKER bet transaction")
 
                 # Show OP_RETURN data for debugging with pattern analysis
                 for i, output in enumerate(tx_details.get('vout', [])):
@@ -954,7 +1105,7 @@ class TacoClickerMempoolMonitor:
             return is_bet
 
         except Exception as e:
-            print(f"❌ Error checking transaction {txid}: {e}")
+            print(f" Error checking transaction {txid}: {e}")
             return False
 
 def main():
@@ -975,47 +1126,49 @@ def main():
             monitor = TacoClickerMempoolMonitor(enable_telegram=False)
             monitor.check_specific_transaction(txid)
         except Exception as e:
-            print(f"❌ Failed to check transaction: {e}")
+            print(f" Failed to check transaction: {e}")
             return 1
         finally:
             if 'monitor' in locals():
                 monitor.cleanup()
         return 0
 
-    # Original monitoring mode
+    # Flags
+    enable_telegram = ('--telegram' in args)
+    simulation_mode = ('--simulate' in args)
+    if enable_telegram:
+        args.remove('--telegram')
+        print("Telegram notifications enabled")
+    if simulation_mode:
+        args.remove('--simulate')
+        print("Simulation mode enabled (synthetic bet flows)")
+
     print("Real-time detection of TACOCLICKER bet transactions")
-    print("📊 Automatic summaries every minute")
-    print("🛑 Press Ctrl+C to stop and see final summary")
+    print("Automatic summaries every minute")
+    print("Press Ctrl+C to stop and see final summary")
     print()
 
-    # Parse command line arguments
-    mempool_interval = 10  # Default 10 seconds for mempool scans
-    block_interval = 5     # Default 5 seconds for block checks
-    enable_telegram = False
-
-    # Check for --telegram flag
-    if '--telegram' in args:
-        enable_telegram = True
-        args.remove('--telegram')
-        print("🤖 Telegram notifications enabled")
+    # Parse positional arguments
+    mempool_interval = 2  # Default 2 seconds for mempool scans
+    block_interval = 2     # Default 2 seconds for block checks
 
     if len(args) > 0:
         try:
             mempool_interval = int(args[0])
         except ValueError:
-            print("Invalid mempool interval, using default 10 seconds")
+            print("Invalid mempool interval, using default 2 seconds")
 
     if len(args) > 1:
         try:
             block_interval = int(args[1])
         except ValueError:
-            print("Invalid block interval, using default 5 seconds")
+            print("Invalid block interval, using default 2 seconds")
 
     try:
-        monitor = TacoClickerMempoolMonitor(enable_telegram=enable_telegram)
+        monitor = TacoClickerMempoolMonitor(enable_telegram=enable_telegram, simulation_mode=simulation_mode)
         monitor.monitor_realtime(mempool_interval, block_interval)
     except Exception as e:
-        print(f"❌ Failed to start monitor: {e}")
+        print(f"Failed to start monitor: {e}")
         return 1
     finally:
         if 'monitor' in locals():

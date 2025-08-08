@@ -89,37 +89,46 @@ class SimpleTelegramBot:
         return sent_count
 
     def send_bet_count_update(self, current_count: int, previous_count: int, new_bets: int, removed_bets: int, next_salsa: int, current_block: int = None) -> bool:
-        """Send bet count variation notification"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        """Send bet count variation notification in compact, readable format.
+        Header uses 🌶️ when the next block is the salsa block, otherwise 🌮.
+        """
+        # Determine context (salsa vs normal)
+        # Only show salsa context when the NEXT block will be salsa (exactly 1 block away)
+        blocks_until_salsa = (next_salsa - current_block) if current_block is not None else None
+        is_salsa_context = blocks_until_salsa is not None and blocks_until_salsa == 1
+        header_emoji = "🌮"  # Always use taco emoji for bet count line
 
-        # Calculate blocks until next salsa
-        blocks_until_salsa = next_salsa - current_block if current_block else 0
-
-        if blocks_until_salsa <= 0:
-            salsa_info = f"🎯 SALSA BLOCK {next_salsa}!"
-        elif blocks_until_salsa <= 5:
-            salsa_info = f"Next Salsa: Block {next_salsa} ({blocks_until_salsa} blocks)"
+        # Build header with next-block number first
+        if current_block is not None:
+            next_block = current_block + 1
+            prefix = f"⛏️ Next block: {next_block}" if is_salsa_context else f"⛏️ Next block: {next_block}"
         else:
-            salsa_info = f"Next Salsa: Block {next_salsa}"
+            prefix = "⛏️ Next block: unknown"
 
-        # Create change indicator
+        # Add salsa warning if next block is salsa
+        if is_salsa_context:
+            message_parts = ["🌶️SALSA BLOCK INCOMING🌶️", prefix]
+        else:
+            message_parts = [prefix]
+
+        # Change indicator
         net_change = current_count - previous_count
         if net_change > 0:
-            change_indicator = f"📈 +{net_change}"
+            header_suffix = f" ({'📈'} +{net_change})"
         elif net_change < 0:
-            change_indicator = f"📉 {net_change}"
+            header_suffix = f" ({'📉'} {net_change})"
         else:
-            change_indicator = "➡️ No change"
+            header_suffix = ""
 
-        # Build detailed message
-        message_parts = [f"🎯 [{timestamp}] TACOCLICKER Bets: {current_count} ({change_indicator})"]
-
+        # Message body
+        if not is_salsa_context:
+            message_parts.append(f"🌶️ Next salsa block: {next_salsa}\n{header_emoji} Taco Clicker Bets: {current_count}{header_suffix}")
+        else:
+            message_parts.append(f"{header_emoji} Taco Clicker Bets: {current_count}{header_suffix}")
         if new_bets > 0:
-            message_parts.append(f"   ➕ New: {new_bets}")
+            message_parts.append(f"➕ New: {new_bets}")
         if removed_bets > 0:
-            message_parts.append(f"   ➖ Removed: {removed_bets}")
-
-        message_parts.append(f"   → {salsa_info}")
+            message_parts.append(f"➖ Removed: {removed_bets}")
 
         message = "\n".join(message_parts)
 
@@ -127,22 +136,14 @@ class SimpleTelegramBot:
         return sent_count > 0
 
     def send_block_analysis(self, block_height: int, expected: int, actual: int, accuracy: float) -> bool:
-        """Send block analysis notification"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        """Send block analysis notification (no timestamp, 🌮 header, grammar-aware)."""
+        # Grammar-aware labels
+        bet_word_expected = "bet" if expected == 1 else "bets"
+        bet_word_actual = "bet" if actual == 1 else "bets"
 
-        # Accuracy indicator
-        if accuracy >= 90:
-            accuracy_icon = "🎯"
-        elif accuracy >= 70:
-            accuracy_icon = "✅"
-        elif accuracy >= 50:
-            accuracy_icon = "⚠️"
-        else:
-            accuracy_icon = "❌"
-
-        message = f"{accuracy_icon} [{timestamp}] Block {block_height} Mined\n"
-        message += f"   Expected: {expected} bets\n"
-        message += f"   Actual: {actual} bets\n"
+        message = f"⛏️ Block {block_height} Mined\n"
+        message += f"   Expected: {expected} {bet_word_expected}\n"
+        message += f"   Actual: {actual} {bet_word_actual}\n"
         message += f"   Accuracy: {accuracy:.1f}%"
 
         sent_count = self.send_to_all_subscribers(message)
@@ -150,9 +151,7 @@ class SimpleTelegramBot:
 
     def send_salsa_block_notification(self, block_height: int) -> bool:
         """Send salsa block notification"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        message = f"🎯 [{timestamp}] SALSA BLOCK {block_height} MINED! 🏆"
-
+        message = f"🌶️ SALSA BLOCK {block_height} MINED! ⛏️"
         sent_count = self.send_to_all_subscribers(message)
         return sent_count > 0
 
@@ -163,8 +162,7 @@ class SimpleTelegramBot:
 
     def send_startup_message(self, next_salsa: int) -> bool:
         """Send startup notification"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        message = f"🤖 [{timestamp}] TACOCLICKER Monitor Started → Next Salsa Block {next_salsa}"
+        message = f"🌶️ Salsabot Started → Next Salsa Block: {next_salsa}"
 
         sent_count = self.send_to_all_subscribers(message)
         return sent_count > 0
@@ -181,9 +179,9 @@ class SimpleTelegramIntegration:
             if self.bot.subscribers:
                 self.bot.send_startup_message(next_salsa)
             
-            print(f"✅ Simple Telegram bot ready with {len(self.bot.subscribers)} subscribers")
-            print("📝 To add subscribers, they need to send their chat ID to you manually")
-            print("   or use the full bot with command handlers")
+            print(f"Simple Telegram bot ready with {len(self.bot.subscribers)} subscribers")
+            print("To add subscribers, they need to send their chat ID to you manually")
+            print("or use the full bot with command handlers")
             return True
         except Exception as e:
             print(f"Failed to start simple Telegram bot: {e}")
@@ -218,12 +216,12 @@ def load_telegram_config(config_file: str = "telegram_config.json") -> Dict:
                 raise ValueError("bot_token not found in config file")
             return config
     except FileNotFoundError:
-        print(f"❌ Config file {config_file} not found!")
+        print(f"Config file {config_file} not found!")
         print("Please create the config file with your bot token:")
         print(f'{{ "bot_token": "YOUR_BOT_TOKEN_HERE" }}')
         raise
     except Exception as e:
-        print(f"❌ Error loading config: {e}")
+        print(f"Error loading config: {e}")
         raise
 
 def add_subscriber_manually():
@@ -236,7 +234,7 @@ def add_subscriber_manually():
         config = load_telegram_config()
         bot = SimpleTelegramBot(config['bot_token'])
     except Exception as e:
-        print(f"❌ Failed to load config: {e}")
+        print(f"Failed to load config: {e}")
         return
     
     print(f"Current subscribers: {len(bot.subscribers)}")
@@ -254,11 +252,11 @@ def add_subscriber_manually():
         bot.add_subscriber(chat_id)
         
         # Send test message
-        test_message = "🎯 Welcome to TACOCLICKER notifications! You're now subscribed."
+        test_message = "Welcome to TACOCLICKER notifications! You're now subscribed."
         if bot.send_message_sync(chat_id, test_message):
-            print("✅ Test message sent successfully!")
+            print("Test message sent successfully!")
         else:
-            print("❌ Failed to send test message")
+            print("Failed to send test message")
 
 def main():
     """Test the simple bot"""
@@ -273,11 +271,11 @@ def main():
     
     # Test startup
     if bot.start_bot(908496):
-        print("✅ Bot started successfully!")
+        print("Bot started successfully!")
         
         # Send test notifications if there are subscribers
         if bot.bot.subscribers:
-            print("📤 Sending test notifications...")
+            print("Sending test notifications...")
             
             bot.send_bet_alert(42, 908496)
             time.sleep(1)
@@ -285,11 +283,11 @@ def main():
             time.sleep(1)
             bot.send_salsa_block_alert(908352)
             
-            print("✅ Test notifications sent!")
+            print("Test notifications sent!")
         else:
-            print("ℹ️  No subscribers yet. Use add_subscriber_manually() to add some.")
+            print("No subscribers yet. Use add_subscriber_manually() to add some.")
     else:
-        print("❌ Failed to start bot")
+        print("Failed to start bot")
 
 if __name__ == "__main__":
     import sys
