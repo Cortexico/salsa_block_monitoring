@@ -89,6 +89,12 @@ python tacoclicker_mempool_monitor.py --telegram
 python tacoclicker_mempool_monitor.py --telegram 15 5
 ```
 
+### Simulation file
+```bash
+# Example with 2 minutes run
+python full_simulation.py --telegram --duration 2
+```
+
 ## 📦 File Dependencies
 
 ```
