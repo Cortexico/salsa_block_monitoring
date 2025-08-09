@@ -1070,7 +1070,7 @@ def get_salsa_block_info() -> Dict:
         blocks_to_next = 144 - (blocks_since_base % 144)
 
         if blocks_to_next == 144:
-            blocks_to_next = 0  # Current block is a salsa block
+            blocks_to_next = 144  # Current block is a salsa block, next is 144 blocks later
 
         next_salsa = current_height + blocks_to_next
 
@@ -1105,12 +1105,12 @@ def get_salsa_block_info_with_analyzer(analyzer: SalsaBlockAnalyzer) -> Dict:
         blocks_to_next = 144 - (blocks_since_base % 144)
 
         if blocks_to_next == 144:
-            blocks_to_next = 0  # Current block is a salsa block
+            blocks_to_next = 144  # Current block is a salsa block, next is 144 blocks later
 
         next_salsa = current_height + blocks_to_next
 
         # Find the most recent salsa block
-        if blocks_to_next == 0:
+        if blocks_to_next == 144:
             most_recent_salsa = current_height
         else:
             most_recent_salsa = current_height - (blocks_since_base % 144)

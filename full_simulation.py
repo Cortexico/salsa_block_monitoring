@@ -61,7 +61,7 @@ class FullTacoClickerSimulation:
         blocks_since_base = current_height - base_salsa
         blocks_to_next = 144 - (blocks_since_base % 144)
         if blocks_to_next == 144:
-            blocks_to_next = 0
+            blocks_to_next = 144  # Current block is a salsa block, next is 144 blocks later
         return current_height + blocks_to_next
 
     def simulate_mempool_activity(self):

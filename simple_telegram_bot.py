@@ -122,7 +122,12 @@ class SimpleTelegramBot:
 
         # Message body
         if not is_salsa_context:
-            message_parts.append(f"🌶️ Next salsa block: {next_salsa}\n{header_emoji} Taco Clicker Bets: {current_count}{header_suffix}")
+            # Calculate blocks left until next salsa block
+            blocks_left = (next_salsa - current_block) if current_block is not None else None
+            if blocks_left is not None:
+                message_parts.append(f"🌶️ Next salsa block: {next_salsa} ({blocks_left} blocks left)\n{header_emoji} Taco Clicker Bets: {current_count}{header_suffix}")
+            else:
+                message_parts.append(f"🌶️ Next salsa block: {next_salsa}\n{header_emoji} Taco Clicker Bets: {current_count}{header_suffix}")
         else:
             message_parts.append(f"{header_emoji} Taco Clicker Bets: {current_count}{header_suffix}")
         if new_bets > 0:
