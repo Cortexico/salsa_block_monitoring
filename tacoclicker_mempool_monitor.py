@@ -86,7 +86,7 @@ class TacoClickerMempoolMonitor:
         self.last_block_time: float = 0.0  # Used to reset mempool baseline after blocks
 
         # Batching for mempool notifications (reduce chat noise)
-        self.batch_window_seconds: float = 10.0
+        self.batch_window_seconds: float = 3.0
         self._batch_accumulator = {
             'new_bets': set(),
             'removed_bets': set(),
@@ -116,13 +116,13 @@ class TacoClickerMempoolMonitor:
         # Setup connection session
         self.session = requests.Session()
         retry_strategy = Retry(
-            total=3,
-            backoff_factor=0.1,
+            total=2,
+            backoff_factor=0.05,
             status_forcelist=[429, 500, 502, 503, 504],
         )
         adapter = HTTPAdapter(
-            pool_connections=self.max_threads,
-            pool_maxsize=self.max_threads * 2,
+            pool_connections=self.max_threads * 2,
+            pool_maxsize=self.max_threads * 4,
             max_retries=retry_strategy
         )
         self.session.mount("http://", adapter)
@@ -245,7 +245,7 @@ class TacoClickerMempoolMonitor:
                 self.rpc_url,
                 json=payload,
                 auth=self.rpc_auth,
-                timeout=10
+                timeout=3
             )
 
             if response.status_code == 200:
@@ -524,6 +524,14 @@ class TacoClickerMempoolMonitor:
             pass
         return "Unknown"
 
+    def _check_single_transaction(self, txid: str) -> bool:
+        """Helper method for parallel transaction checking"""
+        try:
+            tx_details = self.get_transaction_details(txid)
+            return tx_details and self.is_tacoclicker_bet(tx_details)
+        except Exception:
+            return False
+
     def log_bet_transaction(self, txid: str, tx_details: Dict, source: str):
         """Log a detected bet transaction"""
         try:
@@ -569,17 +577,27 @@ class TacoClickerMempoolMonitor:
                 print("No next-block candidates found")
                 return result
 
-            # Find TACOCLICKER bets among candidates
+            # Find TACOCLICKER bets among candidates - OPTIMIZED with parallel processing
             current_bets = set()
 
-            for txid in next_block_candidates:
-                try:
-                    tx_details = self.get_transaction_details(txid)
-                    if tx_details and self.is_tacoclicker_bet(tx_details):
-                        current_bets.add(txid)
-                except Exception as e:
-                    self.logger.debug(f"Error checking candidate {txid}: {e}")
-                    continue
+            # Use ThreadPoolExecutor for parallel transaction checking (faster)
+            with ThreadPoolExecutor(max_workers=min(self.max_threads, len(next_block_candidates))) as executor:
+                # Submit all transaction checks in parallel
+                future_to_txid = {
+                    executor.submit(self._check_single_transaction, txid): txid
+                    for txid in next_block_candidates
+                }
+
+                # Collect results as they complete
+                for future in as_completed(future_to_txid):
+                    txid = future_to_txid[future]
+                    try:
+                        is_bet = future.result()
+                        if is_bet:
+                            current_bets.add(txid)
+                    except Exception as e:
+                        self.logger.debug(f"Error checking candidate {txid}: {e}")
+                        continue
 
             # Calculate changes
             new_bets = current_bets - self.current_mempool_bets
@@ -790,7 +808,7 @@ class TacoClickerMempoolMonitor:
                 return False
         return False
 
-    def monitor_realtime(self, mempool_interval: int = 10, block_check_interval: int = 5):
+    def monitor_realtime(self, mempool_interval: int = 1, block_check_interval: int = 1):
         """Main monitoring loop for real-time bet detection"""
         print("=== TACOCLICKER MEMPOOL MONITOR STARTED ===")
         print(f"Mempool scan interval: {mempool_interval} seconds")
@@ -934,26 +952,30 @@ class TacoClickerMempoolMonitor:
                         if removed_count > 0:
                             print(f"{removed_count} bets removed (low fees)")
 
-                    # Send Telegram notification if batch window elapsed and we have accumulated changes
+                    # Send Telegram notification - OPTIMIZED for faster response
+                    # Send immediately for significant changes (>=3 bets) or when batch window elapsed
                     if self.telegram_bot and batch_window_elapsed:
                         accumulated_new = len(self._batch_accumulator['new_bets'])
                         accumulated_removed = len(self._batch_accumulator['removed_bets'])
+                        significant_change = accumulated_new >= 3 or accumulated_removed >= 3
+                        
+                        if self.telegram_bot and (batch_window_elapsed or significant_change):
+                            if accumulated_new > 0 or accumulated_removed > 0:
+                                try:
+                                    next_salsa = self.get_next_salsa_block(current_height) if current_height else 0
+                                    # Calculate previous count for the batch
+                                    batch_previous_count = bet_changes['current_count'] - accumulated_new + accumulated_removed
 
-                        if accumulated_new > 0 or accumulated_removed > 0:
-                            try:
-                                next_salsa = self.get_next_salsa_block(current_height) if current_height else 0
-                                # Calculate previous count for the batch
-                                batch_previous_count = bet_changes['current_count'] - accumulated_new + accumulated_removed
-
-                                self.telegram_bot.send_bet_count_update(
-                                    bet_changes['current_count'], batch_previous_count,
-                                    accumulated_new, accumulated_removed,
-                                    next_salsa, current_height
-                                )
-                                print(f"Sent Telegram batch update: {bet_changes['current_count']} bets (+{accumulated_new} new, -{accumulated_removed} removed)")
-                            except Exception as e:
-                                self.logger.debug(f"Telegram bet count update failed: {e}")
-                                print(f"Telegram bet update failed: {e}")
+                                    self.telegram_bot.send_bet_count_update(
+                                        bet_changes['current_count'], batch_previous_count,
+                                        accumulated_new, accumulated_removed,
+                                        next_salsa, current_height
+                                    )
+                                    update_type = "immediate" if significant_change else "batch"
+                                    print(f"Sent Telegram {update_type} update: {bet_changes['current_count']} bets (+{accumulated_new} new, -{accumulated_removed} removed)")
+                                except Exception as e:
+                                    self.logger.debug(f"Telegram bet count update failed: {e}")
+                                    print(f"Telegram bet update failed: {e}")
 
                         # Reset batch window timer and clear accumulators
                         self._batch_accumulator['new_bets'].clear()
@@ -966,8 +988,9 @@ class TacoClickerMempoolMonitor:
                     self.show_summary()
                     self.last_summary_time = current_time
 
-                # Sleep for block check interval
-                time.sleep(block_check_interval)
+                # Sleep for block check interval - OPTIMIZED for responsiveness
+                # Use shorter sleep with more frequent checks for better responsiveness
+                time.sleep(min(block_check_interval, 0.5))  # Max 0.5s sleep for better responsiveness
 
         except KeyboardInterrupt:
             print("\nMonitoring stopped by user")
@@ -980,31 +1003,48 @@ class TacoClickerMempoolMonitor:
 
     def show_final_summary(self):
         """Show final summary when monitoring stops"""
-        current_time = time.time()
-        session_duration = current_time - self.session_start_time
-        hours_running = session_duration / 3600
-        total_bets = self.total_mempool_bets + self.total_block_bets
+        try:
+            current_time = time.time()
+            session_duration = current_time - self.session_start_time
+            hours_running = session_duration / 3600
+            total_bets = getattr(self, 'total_unique_bets_seen', 0)  # Safe attribute access
 
-        print(f"\n=== FINAL SESSION SUMMARY ===")
-        print(f"   Total Duration: {hours_running:.2f} hours")
-        print(f"   Total Bets Detected: {total_bets}")
-        print(f"      From Mempool: {self.total_mempool_bets}")
-        print(f"      From Blocks: {self.total_block_bets}")
+            print(f"\n=== FINAL SESSION SUMMARY ===")
+            print(f"   Total Duration: {hours_running:.2f} hours")
+            print(f"   Total Unique Bets Seen: {total_bets}")
 
-        if hours_running > 0:
-            rate_per_hour = total_bets / hours_running
-            print(f"   Average Rate: {rate_per_hour:.1f} bets/hour")
+            # Safe access to current mempool bets
+            current_bets = getattr(self, 'current_mempool_bets', set())
+            print(f"   Current Next-Block Bets: {len(current_bets)}")
 
-        if session_duration > 60:
-            minutes = session_duration / 60
-            rate_per_minute = total_bets / minutes
-            print(f"   Average Rate: {rate_per_minute:.2f} bets/minute")
+            if hours_running > 0:
+                rate_per_hour = total_bets / hours_running
+                print(f"   Average Rate: {rate_per_hour:.1f} bets/hour")
 
-        print(f"   Total RPC Calls: {self.rpc_calls_made}")
-        print("=" * 50)
+            if session_duration > 60:
+                minutes = session_duration / 60
+                rate_per_minute = total_bets / minutes
+                print(f"   Average Rate: {rate_per_minute:.2f} bets/minute")
 
-        # Log final summary
-        self.logger.info(f"FINAL SUMMARY - Duration: {hours_running:.2f}h, Total Bets: {total_bets}, RPC Calls: {self.rpc_calls_made}")
+            # Show block analysis stats if available
+            stats = getattr(self, 'mined_vs_expected_stats', {})
+            if stats.get('total_blocks_analyzed', 0) > 0:
+                print(f"   Blocks Analyzed: {stats['total_blocks_analyzed']}")
+                print(f"   Prediction Accuracy: {stats['accuracy_rate']:.1f}%")
+
+            rpc_calls = getattr(self, 'rpc_calls_made', 0)
+            print(f"   Total RPC Calls: {rpc_calls}")
+            print("=" * 50)
+
+            # Log final summary safely
+            if hasattr(self, 'logger'):
+                self.logger.info(f"FINAL SUMMARY - Duration: {hours_running:.2f}h, Total Bets: {total_bets}, RPC Calls: {rpc_calls}")
+
+        except Exception as e:
+            print(f"\n=== FINAL SESSION SUMMARY (ERROR) ===")
+            print(f"   Error generating summary: {e}")
+            print(f"   Session ended")
+            print("=" * 50)
 
     def show_summary(self):
         """Show periodic summary statistics"""
@@ -1149,20 +1189,20 @@ def main():
     print()
 
     # Parse positional arguments
-    mempool_interval = 2  # Default 2 seconds for mempool scans
-    block_interval = 2     # Default 2 seconds for block checks
+    mempool_interval = 1  # Default 1 seconds for mempool scans
+    block_interval = 1     # Default 1 seconds for block checks
 
     if len(args) > 0:
         try:
             mempool_interval = int(args[0])
         except ValueError:
-            print("Invalid mempool interval, using default 2 seconds")
+            print("Invalid mempool interval, using default 1 seconds")
 
     if len(args) > 1:
         try:
             block_interval = int(args[1])
         except ValueError:
-            print("Invalid block interval, using default 2 seconds")
+            print("Invalid block interval, using default 1 seconds")
 
     try:
         monitor = TacoClickerMempoolMonitor(enable_telegram=enable_telegram, simulation_mode=simulation_mode)

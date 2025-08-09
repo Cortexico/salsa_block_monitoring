@@ -58,7 +58,7 @@ class SimpleTelegramBot:
                 "text": message
             }
             
-            response = requests.post(url, json=data, timeout=10)
+            response = requests.post(url, json=data, timeout=1)
             return response.status_code == 200
         except Exception as e:
             print(f"Failed to send message to {chat_id}: {e}")
