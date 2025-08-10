@@ -1,5 +1,8 @@
 {
   "subscribers": [
-    "1234567890"
+    {
+      "chat_id": "YOUR_CHAT_ID",
+      "topic_id": 2
+    }
   ]
 }

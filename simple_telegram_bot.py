@@ -17,7 +17,7 @@ class SimpleTelegramBot:
 
     def __init__(self, bot_token: str):
         self.bot_token = bot_token
-        self.subscribers = set()
+        self.subscribers = []  # Changed to list to support topic objects
         self.load_subscribers()
 
     def load_subscribers(self):
@@ -25,43 +25,82 @@ class SimpleTelegramBot:
         try:
             with open("telegram_subscribers.json", "r") as f:
                 data = json.load(f)
-                self.subscribers = set(data.get("subscribers", []))
+                raw_subscribers = data.get("subscribers", [])
+
+                # Handle both old format (strings) and new format (objects)
+                self.subscribers = []
+                for sub in raw_subscribers:
+                    if isinstance(sub, str):
+                        # Old format: just chat_id
+                        self.subscribers.append({"chat_id": sub})
+                    elif isinstance(sub, dict):
+                        # New format: object with chat_id and optional topic_id
+                        self.subscribers.append(sub)
+
                 print(f"Loaded {len(self.subscribers)} subscribers")
         except FileNotFoundError:
-            self.subscribers = set()
+            self.subscribers = []
             print("No subscribers file found, starting fresh")
         except Exception as e:
             print(f"Error loading subscribers: {e}")
-            self.subscribers = set()
+            self.subscribers = []
 
     def save_subscribers(self):
         """Save subscribers to file"""
         try:
-            data = {"subscribers": list(self.subscribers)}
+            data = {"subscribers": self.subscribers}
             with open("telegram_subscribers.json", "w") as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
             print(f"Error saving subscribers: {e}")
 
-    def add_subscriber(self, chat_id: str):
-        """Add a new subscriber"""
-        self.subscribers.add(str(chat_id))
-        self.save_subscribers()
-        print(f"Added subscriber: {chat_id}")
+    def add_subscriber(self, chat_id: str, topic_id: int = None):
+        """Add a new subscriber with optional topic support"""
+        subscriber = {"chat_id": str(chat_id)}
+        if topic_id is not None:
+            subscriber["topic_id"] = topic_id
 
-    def send_message_sync(self, chat_id: str, message: str) -> bool:
-        """Send a message synchronously using requests"""
+        # Check if subscriber already exists
+        for existing in self.subscribers:
+            if (existing["chat_id"] == subscriber["chat_id"] and
+                existing.get("topic_id") == subscriber.get("topic_id")):
+                print(f"Subscriber already exists: {chat_id}" + (f" (topic {topic_id})" if topic_id else ""))
+                return
+
+        self.subscribers.append(subscriber)
+        self.save_subscribers()
+        topic_info = f" (topic {topic_id})" if topic_id else ""
+        print(f"Added subscriber: {chat_id}{topic_info}")
+
+    def send_message_sync(self, chat_id: str, message: str, topic_id: int = None) -> bool:
+        """Send a message synchronously using requests with optional topic support"""
         try:
             url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
             data = {
                 "chat_id": chat_id,
                 "text": message
             }
-            
-            response = requests.post(url, json=data, timeout=1)
-            return response.status_code == 200
+
+            # Add topic support for supergroups with topics
+            if topic_id is not None:
+                data["message_thread_id"] = topic_id
+
+            topic_info = f" (topic {topic_id})" if topic_id else ""
+            print(f"Sending message to {chat_id}{topic_info}...")
+
+            response = requests.post(url, json=data, timeout=10)
+
+            if response.status_code == 200:
+                print(f"Message sent successfully to {chat_id}{topic_info}")
+                return True
+            else:
+                print(f"Failed to send message to {chat_id}{topic_info}: HTTP {response.status_code}")
+                print(f"Response: {response.text}")
+                return False
+
         except Exception as e:
-            print(f"Failed to send message to {chat_id}: {e}")
+            topic_info = f" (topic {topic_id})" if topic_id else ""
+            print(f"Exception sending message to {chat_id}{topic_info}: {e}")
             return False
 
     def send_to_all_subscribers(self, message: str) -> int:
@@ -69,23 +108,27 @@ class SimpleTelegramBot:
         if not self.subscribers:
             print("No subscribers to send message to")
             return 0
-        
+
         sent_count = 0
-        failed_chats = []
-        
-        for chat_id in self.subscribers.copy():
-            if self.send_message_sync(chat_id, message):
+        failed_subscribers = []
+
+        for subscriber in self.subscribers.copy():
+            chat_id = subscriber["chat_id"]
+            topic_id = subscriber.get("topic_id")
+
+            if self.send_message_sync(chat_id, message, topic_id):
                 sent_count += 1
             else:
-                failed_chats.append(chat_id)
-        
-        # Remove failed chats (blocked/deleted)
-        for chat_id in failed_chats:
-            self.subscribers.discard(chat_id)
-        
-        if failed_chats:
+                failed_subscribers.append(subscriber)
+
+        # Remove failed subscribers (blocked/deleted)
+        for failed_sub in failed_subscribers:
+            if failed_sub in self.subscribers:
+                self.subscribers.remove(failed_sub)
+
+        if failed_subscribers:
             self.save_subscribers()
-        
+
         return sent_count
 
     def send_bet_count_update(self, current_count: int, previous_count: int, new_bets: int, removed_bets: int, next_salsa: int, current_block: int = None) -> bool:
@@ -241,24 +284,44 @@ def add_subscriber_manually():
     except Exception as e:
         print(f"Failed to load config: {e}")
         return
-    
+
     print(f"Current subscribers: {len(bot.subscribers)}")
     if bot.subscribers:
-        for chat_id in bot.subscribers:
-            print(f"  - {chat_id}")
-    
+        for subscriber in bot.subscribers:
+            chat_id = subscriber["chat_id"]
+            topic_id = subscriber.get("topic_id")
+            topic_info = f" (topic {topic_id})" if topic_id else ""
+            print(f"  - {chat_id}{topic_info}")
+
     print()
-    chat_id = input("Enter chat ID to add (or 'quit' to exit): ").strip()
-    
-    if chat_id.lower() == 'quit':
+    print("For regular chats/channels: just enter the chat ID")
+    print("For topic-specific messaging: enter chat_id:topic_id (e.g., -1001234567890:1)")
+    print()
+
+    user_input = input("Enter chat ID (or chat_id:topic_id for topics, or 'quit' to exit): ").strip()
+
+    if user_input.lower() == 'quit':
         return
-    
-    if chat_id:
-        bot.add_subscriber(chat_id)
-        
+
+    if user_input:
+        # Parse input for topic support
+        if ':' in user_input:
+            try:
+                chat_id, topic_id = user_input.split(':', 1)
+                topic_id = int(topic_id)
+            except ValueError:
+                print("Invalid format. Use chat_id:topic_id (e.g., -1001234567890:1)")
+                return
+        else:
+            chat_id = user_input
+            topic_id = None
+
+        bot.add_subscriber(chat_id, topic_id)
+
         # Send test message
-        test_message = "Welcome to TACOCLICKER notifications! You're now subscribed."
-        if bot.send_message_sync(chat_id, test_message):
+        topic_info = f" to topic {topic_id}" if topic_id else ""
+        test_message = f"Welcome to TACOCLICKER notifications! You're now subscribed{topic_info}."
+        if bot.send_message_sync(chat_id, test_message, topic_id):
             print("Test message sent successfully!")
         else:
             print("Failed to send test message")
